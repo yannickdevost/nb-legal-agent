@@ -128,7 +128,14 @@ def get_lookback_date(last_run_date):
 def is_criminal_by_topics(topics):
     if not topics:
         return None
-    topic_ids = {t.get("topicId", "") for t in topics}
+    # CanLII API returns topics as either dicts {"topicId": "..."} or plain strings
+    # Handle both formats gracefully
+    topic_ids = set()
+    for t in topics:
+        if isinstance(t, dict):
+            topic_ids.add(t.get("topicId", ""))
+        elif isinstance(t, str):
+            topic_ids.add(t)
     if topic_ids & CRIMINAL_TOPIC_IDS:
         return True
     return False
