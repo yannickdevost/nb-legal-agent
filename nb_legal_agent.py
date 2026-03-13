@@ -1,21 +1,27 @@
 """
-NB Legal Agent v6 - CanLII Criminal Law Case Monitor
-New in v6:
-  - Compatible with GitHub Actions (free cloud hosting)
-  - API keys and email credentials are read from environment variables
-    so they are never stored in the script itself (required for GitHub)
+NB Legal Agent v7 - NB Criminal Law Case Monitor
+New in v7:
+  - SECOND SOURCE: NB Courts website (courtsnb-coursnb.ca)
+    * Scrapes Court of Appeal decisions directly as PDFs
+    * Typically 1-4 weeks AHEAD of CanLII for Court of Appeal cases
+    * Both English and French decisions captured
+    * PDF text extracted and passed to Claude for summary + analysis
+  - Fixed CanLII topics filter to handle missing topic data (NB not yet enriched)
+  - Cases from both sources deduplicated by citation number
 
-All v5 features retained:
-  - "Commentaires / Comments" analytical section per case
-  - CanLII topic-based criminal law filtering
-  - English + French court monitoring
-  - Smart lookback window (30 days first run, then from last run date)
-  - Rich email subject line with offence types
-  - Table of contents in email
+All v6 features retained:
+  - Compatible with GitHub Actions (free cloud hosting)
+  - Keys read from environment variables
+  - "Comments" analytical section (7 sub-sections) per case
+  - CanLII topic + keyword criminal law filtering
+  - English + French monitoring
+  - Smart lookback window
+  - Rich subject line and table of contents in email
 """
 
 import os
 import re
+import io
 import json
 import time
 import smtplib
@@ -26,11 +32,7 @@ from email.mime.text import MIMEText
 from collections import Counter
 
 # ============================================================
-# CONFIGURATION
-# Keys are read from environment variables — do NOT hardcode
-# them here. On GitHub Actions they come from Secrets.
-# For local testing on your laptop, see the guide for how to
-# set temporary environment variables in Command Prompt.
+# CONFIGURATION — keys come from GitHub Secrets / env vars
 # ============================================================
 
 CANLII_API_KEY    = os.environ.get("CANLII_API_KEY", "")
@@ -40,17 +42,35 @@ EMAIL_PASSWORD    = os.environ.get("EMAIL_PASSWORD", "")
 EMAIL_RECEIVER    = os.environ.get("EMAIL_RECEIVER", "")
 
 # ============================================================
-# COURT DEFINITIONS
+# COURT DEFINITIONS — CanLII sources
 # ============================================================
 
-NB_COURTS = [
+NB_COURTS_CANLII = [
     {"id": "nbpc", "name": "NB Provincial Court (EN)",          "lang": "en"},
     {"id": "nbkb", "name": "Court of King's Bench (EN)",        "lang": "en"},
-    {"id": "nbca", "name": "NB Court of Appeal (EN)",           "lang": "en"},
+    {"id": "nbca", "name": "NB Court of Appeal — CanLII (EN)", "lang": "en"},
     {"id": "nbcp", "name": "Cour provinciale du N.-B. (FR)",    "lang": "fr"},
     {"id": "nbbr", "name": "Cour du Banc du Roi du N.-B. (FR)", "lang": "fr"},
-    {"id": "nbca", "name": "Cour d'appel du N.-B. (FR)",        "lang": "fr"},
+    {"id": "nbca", "name": "Cour d'appel du N.-B. — CanLII (FR)", "lang": "fr"},
 ]
+
+# NB Courts website — Court of Appeal decisions by month
+# URL pattern: /content/cour/{lang}/appeal/content/decisions/{year}/{month}.html
+# French:      /content/cour/fr/appel/content/decisions/{year}/{mars}.html
+NBCOURTS_BASE = "https://www.courtsnb-coursnb.ca"
+NBCOURTS_CA_EN = "/content/cour/en/appeal/content/decisions/{year}/{month}.html"
+NBCOURTS_CA_FR = "/content/cour/fr/appel/content/decisions/{year}/{month_fr}.html"
+
+MONTH_NAMES_EN = {
+    1:"january", 2:"february", 3:"march", 4:"april",
+    5:"may", 6:"june", 7:"july", 8:"august",
+    9:"september", 10:"october", 11:"november", 12:"december"
+}
+MONTH_NAMES_FR = {
+    1:"janvier", 2:"fevrier", 3:"mars", 4:"avril",
+    5:"mai", 6:"juin", 7:"juillet", 8:"aout",
+    9:"septembre", 10:"octobre", 11:"novembre", 12:"decembre"
+}
 
 # ============================================================
 # CRIMINAL LAW FILTER
@@ -126,16 +146,21 @@ def get_lookback_date(last_run_date):
 # ============================================================
 
 def is_criminal_by_topics(topics):
+    """
+    Returns True  = confirmed criminal by CanLII topics
+    Returns False = confirmed NOT criminal
+    Returns None  = no topic data (NB enrichment not yet rolled out — fall through)
+    """
     if not topics:
         return None
-    # CanLII API returns topics as either dicts {"topicId": "..."} or plain strings
-    # Handle both formats gracefully
     topic_ids = set()
     for t in topics:
         if isinstance(t, dict):
             topic_ids.add(t.get("topicId", ""))
         elif isinstance(t, str):
             topic_ids.add(t)
+    if not topic_ids:
+        return None
     if topic_ids & CRIMINAL_TOPIC_IDS:
         return True
     return False
@@ -151,7 +176,7 @@ def is_criminal_by_keywords(title, citation, text_snippet="", lang="en"):
 # CANLII API
 # ============================================================
 
-def fetch_recent_cases(court_id, lang, since_date):
+def fetch_recent_cases_canlii(court_id, lang, since_date):
     url = (
         f"https://api.canlii.org/v1/caseBrowse/{lang}/{court_id}/"
         f"?offset=0&resultCount=50&publishedAfter={since_date}&api_key={CANLII_API_KEY}"
@@ -175,7 +200,7 @@ def fetch_case_metadata(court_id, case_id, lang):
         return [], []
 
 
-def fetch_case_text(court_id, case_id, lang):
+def fetch_case_text_canlii(court_id, case_id, lang):
     url = (
         f"https://api.canlii.org/v1/caseDocument/{lang}/{court_id}/{case_id}/"
         f"?api_key={CANLII_API_KEY}"
@@ -187,14 +212,162 @@ def fetch_case_text(court_id, case_id, lang):
 
 
 # ============================================================
-# SUMMARIZATION  (Call 1 of 2 per case)
+# NB COURTS WEBSITE — Court of Appeal scraper
+# ============================================================
+
+def extract_pdf_text(pdf_bytes):
+    """Extract text from a PDF using pypdf."""
+    try:
+        import pypdf
+        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() or ""
+        return text.strip()
+    except Exception as e:
+        print(f"      PDF extraction error: {e}")
+        return ""
+
+
+def fetch_nbcourts_decisions(since_date):
+    """
+    Scrape the NB Courts website Court of Appeal decisions pages
+    for the current and previous month(s), returning new decisions
+    published after since_date as a list of dicts.
+
+    Returns list of:
+      { title, citation, url, pdf_url, date_str, lang, source }
+    """
+    since_dt = datetime.strptime(since_date, "%Y-%m-%d")
+    today    = datetime.now()
+
+    # Build list of (year, month) tuples to check — current month + any prior
+    # months still within the lookback window
+    months_to_check = set()
+    cursor = today.replace(day=1)
+    while cursor >= since_dt.replace(day=1):
+        months_to_check.add((cursor.year, cursor.month))
+        # Go back one month
+        if cursor.month == 1:
+            cursor = cursor.replace(year=cursor.year - 1, month=12)
+        else:
+            cursor = cursor.replace(month=cursor.month - 1)
+
+    decisions = []
+    seen_pdfs = set()
+
+    for year, month in sorted(months_to_check):
+        month_en = MONTH_NAMES_EN[month]
+        url_en   = NBCOURTS_BASE + NBCOURTS_CA_EN.format(year=year, month=month_en)
+
+        print(f"   NB Courts — scraping Court of Appeal {month_en.capitalize()} {year} ...")
+        try:
+            resp = requests.get(url_en, timeout=20)
+            if resp.status_code != 200:
+                print(f"      HTTP {resp.status_code} — skipping")
+                continue
+
+            html = resp.text
+
+            # Find all PDF links on the page — each is one decision
+            # Pattern: href="...pdf"  with title and citation in the link text
+            pdf_links = re.findall(
+                r'<a href="([^"]+\.pdf)"[^>]*>([^<]+)</a>',
+                html, re.IGNORECASE
+            )
+
+            for pdf_path, link_text in pdf_links:
+                link_text = link_text.strip()
+                if not link_text:
+                    continue
+
+                # Build full PDF URL
+                if pdf_path.startswith("http"):
+                    pdf_url = pdf_path
+                else:
+                    pdf_url = NBCOURTS_BASE + pdf_path
+
+                if pdf_url in seen_pdfs:
+                    continue
+                seen_pdfs.add(pdf_url)
+
+                # Extract citation from link text
+                # e.g. "Sheppard v. R., 2026 NBCA 23 - 45-25-CA - Judgment"
+                citation_match = re.search(r'(\d{4}\s+NBCA\s+\d+)', link_text)
+                citation = citation_match.group(1) if citation_match else ""
+
+                # Extract case name (everything before the citation)
+                if citation:
+                    title = link_text[:link_text.find(citation)].strip().rstrip(",- ")
+                else:
+                    title = link_text
+
+                # Try to extract date from surrounding HTML
+                # The page has bold headings like <strong>Thursday - March 12</strong>
+                # Find the date heading that precedes this link
+                date_str = ""
+                link_pos = html.find(f'href="{pdf_path}"')
+                if link_pos == -1:
+                    link_pos = html.find(pdf_path)
+                if link_pos > 0:
+                    # Search backwards for a date heading
+                    preceding = html[:link_pos]
+                    date_matches = re.findall(
+                        r'(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)'
+                        r'\s*[-–]\s*(\w+\s+\d+)',
+                        preceding
+                    )
+                    if date_matches:
+                        raw_date = date_matches[-1].strip()  # most recent heading before link
+                        try:
+                            dt = datetime.strptime(f"{raw_date} {year}", "%B %d %Y")
+                            date_str = dt.strftime("%Y-%m-%d")
+                        except ValueError:
+                            date_str = ""
+
+                # Skip if before lookback window
+                if date_str:
+                    try:
+                        decision_dt = datetime.strptime(date_str, "%Y-%m-%d")
+                        if decision_dt < since_dt:
+                            continue
+                    except ValueError:
+                        pass
+
+                # Determine language from link text / title
+                # French cases typically contain "c." instead of "v." and French words
+                lang = "fr" if re.search(r'\bc\.\s+[A-Z]|\bC\.\s+R\.', link_text) else "en"
+
+                decisions.append({
+                    "title":    title,
+                    "citation": citation,
+                    "url":      url_en,        # page URL (for email link)
+                    "pdf_url":  pdf_url,
+                    "date_str": date_str,
+                    "lang":     lang,
+                    "source":   "nbcourts",
+                })
+
+        except Exception as e:
+            print(f"      WARNING: Could not fetch NB Courts page: {e}")
+
+    print(f"   NB Courts — found {len(decisions)} Court of Appeal decision(s) in lookback window")
+    return decisions
+
+
+def fetch_pdf_text(pdf_url):
+    """Download a PDF from the NB Courts website and extract its text."""
+    resp = requests.get(pdf_url, timeout=30)
+    resp.raise_for_status()
+    return extract_pdf_text(resp.content)
+
+
+# ============================================================
+# SUMMARIZATION  (Claude call 1 of 2)
 # ============================================================
 
 def summarize_case(case_text, case_title, citation, lang="en"):
-    """
-    First Claude call: structured factual summary of the case.
-    Sentencing range is no longer here — it moved to the Comments section.
-    """
+    """Structured factual summary. Sentencing range is in the Comments section."""
     import anthropic
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -254,19 +427,11 @@ CASE TEXT:
 
 
 # ============================================================
-# COMMENTARY  (Call 2 of 2 per case)
+# COMMENTARY  (Claude call 2 of 2)
 # ============================================================
 
 def analyze_case(case_text, case_title, citation, summary, lang="en"):
-    """
-    Second Claude call: analytical commentary written from the
-    perspective of a senior Crown Prosecutor in New Brunswick.
-
-    This is intentionally separate from the summary so Claude can
-    focus purely on legal analysis without being constrained by the
-    structured summary format. The summary is passed in as context
-    so Claude does not need to re-read the full case text for facts.
-    """
+    """Analytical commentary from the perspective of a senior NB Crown Prosecutor."""
     import anthropic
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -279,107 +444,78 @@ def analyze_case(case_text, case_title, citation, summary, lang="en"):
 avec une expertise approfondie en droit criminel canadien, en jurisprudence du Nouveau-Brunswick
 et des provinces atlantiques, ainsi qu'en droit constitutionnel (Charte canadienne des droits et libertés).
 
-Tu viens de lire la décision suivante et d'en prendre connaissance grâce au résumé ci-dessous.
-Rédige maintenant une section de COMMENTAIRES analytiques EN FRANÇAIS, structurée ainsi :
+Rédige une section de COMMENTAIRES analytiques EN FRANÇAIS, structurée ainsi :
 
 **📌 Pertinence**
 Cette décision est-elle pertinente pour la pratique quotidienne d'un procureur de la Couronne au N.-B. ?
-Pourquoi, ou pourquoi pas ? S'agit-il d'une décision routinière ou a-t-elle une portée plus large ?
 
 **⚖️ Impact sur le droit au Nouveau-Brunswick**
 Cette décision modifie-t-elle, clarifie-t-elle ou confirme-t-elle le droit applicable au N.-B. ?
-S'inscrit-elle dans une tendance jurisprudentielle ? A-t-elle une portée limitée au cas d'espèce
-ou pourrait-elle servir de précédent ?
+S'inscrit-elle dans une tendance jurisprudentielle ? Pourrait-elle servir de précédent ?
 
 **🔄 Conflits et tensions jurisprudentiels**
 Cette décision est-elle en opposition ou en tension avec d'autres décisions — que ce soit d'autres
-tribunaux du N.-B., d'autres provinces, ou de la Cour suprême du Canada ? Y a-t-il une divergence
-entre les provinces sur la question de droit en cause ? Si oui, lesquelles et quel est l'état du droit ?
+tribunaux du N.-B., d'autres provinces, ou de la Cour suprême du Canada ?
 
 **🌐 Comparaison avec les autres provinces et les tribunaux supérieurs**
-Le droit appliqué dans cette décision est-il le même dans les autres provinces canadiennes ?
-Y a-t-il des divergences notables entre provinces ou entre niveaux de juridiction ?
-La Cour suprême du Canada s'est-elle prononcée sur cette question ? Si oui, la décision
-est-elle conforme à l'arrêt de la Cour suprême ?
+Le droit appliqué est-il le même dans les autres provinces ? La Cour suprême du Canada s'est-elle
+prononcée sur cette question ? Si oui, la décision est-elle conforme à l'arrêt de la Cour suprême ?
 
 **📏 Analyse de la peine (le cas échéant)**
-Si la décision porte sur la détermination de la peine :
-— Quelle est la fourchette habituelle pour cette infraction au N.-B. et dans les provinces atlantiques ?
-— La peine imposée est-elle dans le bas, le milieu ou le haut de cette fourchette ?
-— Est-elle remarquablement clémente ou sévère ? Pourquoi le tribunal a-t-il choisi cette peine ?
-— Y a-t-il des circonstances aggravantes ou atténuantes significatives à noter ?
-Si ce n'est pas une décision sur la peine, écris : N/A
+Si c'est une décision sur la peine : fourchette habituelle au N.-B., position de cette peine dans la
+fourchette, facteurs aggravants/atténuants notables. Sinon : N/A
 
 **⚠️ Erreurs judiciaires potentielles et raisonnement questionnable**
-À ton avis d'expert, le juge a-t-il commis une erreur de droit ou de fait ?
-Le raisonnement juridique est-il solide, ou y a-t-il des lacunes, des contradictions
-ou des conclusions qui semblent mal fondées ? Cette décision serait-elle susceptible
-d'être infirmée en appel ? Sois direct et honnête dans ton analyse, même si c'est critique.
-Si le raisonnement te semble irréprochable, dis-le.
+Le juge a-t-il commis une erreur de droit ou de fait ? Le raisonnement est-il solide ?
+Cette décision serait-elle susceptible d'être infirmée en appel ? Sois direct et honnête.
 
 **💡 Points d'action pour la Couronne**
-Y a-t-il des éléments que la Couronne devrait surveiller, des arguments à préparer,
-des distinctions à noter pour des dossiers similaires, ou des domaines où cette décision
-pourrait être invoquée ou distinguée à l'avenir ?
+Éléments à surveiller, arguments à préparer, distinctions à noter pour des dossiers similaires.
 
 ---
-RÉSUMÉ DE LA DÉCISION :
+RÉSUMÉ :
 {summary}
 
 ---
-TEXTE COMPLET DE LA DÉCISION :
+TEXTE COMPLET :
 {case_text}
 """
     else:
         prompt = f"""You are a senior Crown Prosecutor in New Brunswick, Canada,
-with deep expertise in Canadian criminal law, New Brunswick and Atlantic Canadian case law,
-and constitutional law under the Canadian Charter of Rights and Freedoms.
+with deep expertise in Canadian criminal law, NB and Atlantic Canadian case law,
+and constitutional law under the Charter.
 
-You have just read the following decision and have the summary below as context.
 Write an analytical COMMENTS section structured exactly as follows:
 
 **📌 Relevance**
 Is this decision relevant to the day-to-day practice of a Crown Prosecutor in NB?
-Why or why not? Is this a routine decision, or does it have broader significance?
+Why or why not? Routine or broader significance?
 
 **⚖️ Impact on New Brunswick Law**
-Does this decision change, clarify, or confirm the law as it applies in NB?
-Does it fit within a broader jurisprudential trend? Is its effect limited to the
-specific facts, or could it be used as a precedent in future cases?
+Does this decision change, clarify, or confirm the law in NB?
+Does it fit a broader jurisprudential trend? Could it be used as precedent?
 
 **🔄 Conflicts and Tensions with Other Decisions**
-Is this decision in conflict or tension with other decisions — whether from other NB courts,
-other provinces, or the Supreme Court of Canada? Is there a split between provinces on the
-legal question at issue? If so, what is the current state of the law?
+Is this in conflict or tension with other NB decisions, other provinces, or the SCC?
+Is there a provincial split on this legal question?
 
 **🌐 Comparison with Other Provinces and Higher Courts**
-Is the law applied in this decision the same across Canadian provinces?
-Are there notable differences between provinces or levels of court?
-Has the Supreme Court of Canada addressed this issue? If so, is this decision
-consistent with what the Supreme Court has said?
+Is the law applied here consistent across Canadian provinces?
+Has the Supreme Court of Canada addressed this issue? Is this decision consistent with the SCC?
 
 **📏 Sentencing Analysis (if applicable)**
-If this is a sentencing decision:
-— What is the typical sentencing range for this offence in NB and Atlantic Canada?
-— Is the sentence imposed at the low end, mid-range, or high end of that range?
-— Is it notably lenient or severe? What drove the court's choice?
-— Are there significant aggravating or mitigating factors worth noting?
-If this is not a sentencing decision, write: N/A
+If sentencing: typical range in NB/Atlantic Canada, where this sentence falls, notable
+aggravating/mitigating factors. If not a sentencing decision: N/A
 
 **⚠️ Potential Judicial Errors and Questionable Reasoning**
-In your expert opinion, did the judge make an error of law or fact?
-Is the legal reasoning sound, or are there gaps, contradictions, or conclusions
-that appear poorly grounded? Would this decision be vulnerable on appeal?
-Be direct and honest, even if your assessment is critical. If the reasoning
-appears sound, say so.
+Did the judge make an error of law or fact? Is the reasoning sound?
+Would this be vulnerable on appeal? Be direct and honest.
 
 **💡 Action Points for the Crown**
-Are there things the Crown should watch for, arguments to prepare, distinctions
-to draw in similar cases, or ways this decision might be invoked or distinguished
-in future proceedings?
+Things to watch for, arguments to prepare, distinctions to draw in similar cases.
 
 ---
-CASE SUMMARY (for context):
+CASE SUMMARY:
 {summary}
 
 ---
@@ -434,22 +570,29 @@ def extract_offence_tags(summaries_by_court):
 # ============================================================
 
 def render_markdown_bold(text):
-    """Convert **text** to <strong>text</strong> and newlines to <br>."""
     return re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', text.replace("\n", "<br>"))
+
+
+def source_badge(source):
+    if source == "nbcourts":
+        return ('<span style="background:#fff3cd; color:#7a4a00; font-size:11px; '
+                'padding:2px 7px; border-radius:10px; margin-left:6px; '
+                'font-weight:bold;">NB Courts</span>')
+    return ('<span style="background:#e8eef8; color:#1a3a5c; font-size:11px; '
+            'padding:2px 7px; border-radius:10px; margin-left:6px;">CanLII</span>')
 
 
 def build_email_html(summaries_by_court, since_date):
     today         = datetime.now().strftime("%B %d, %Y")
     since_display = datetime.strptime(since_date, "%Y-%m-%d").strftime("%B %d, %Y")
 
-    # Table of contents
     toc_items = ""
     for court_name, cases in summaries_by_court.items():
         if cases:
             anchor = re.sub(r"[^a-z0-9\-]", "", court_name.lower().replace(" ", "-"))
             toc_items += (
                 f'<li><a href="#{anchor}" style="color:#1a3a5c;">'
-                f'{court_name} — {len(cases)} décision{"s" if len(cases) != 1 else ""}'
+                f'{court_name} — {len(cases)} decision{"s" if len(cases)!=1 else ""}'
                 f'</a></li>'
             )
 
@@ -463,14 +606,20 @@ def build_email_html(summaries_by_court, since_date):
         </div>"""
 
     html = f"""
-    <html><body style="font-family: Calibri, Arial, sans-serif; max-width: 860px;
-                       margin: auto; color: #222; padding: 16px;">
+    <html><body style="font-family:Calibri,Arial,sans-serif; max-width:860px;
+                       margin:auto; color:#222; padding:16px;">
     <h1 style="color:#1a3a5c; border-bottom:3px solid #1a3a5c; padding-bottom:10px;">
         ⚖️ Digest du droit criminel — N.-B. / NB Criminal Law Digest
     </h1>
     <p style="color:#555; font-size:14px;">
-        Nouvelles décisions / New decisions — CanLII —
+        Nouvelles décisions / New decisions —
         <strong>{since_display}</strong> au/to <strong>{today}</strong>
+    </p>
+    <p style="color:#888; font-size:12px;">
+        Sources: CanLII API &nbsp;|&nbsp;
+        <span style="background:#fff3cd; color:#7a4a00; padding:1px 6px;
+              border-radius:8px; font-weight:bold;">NB Courts</span>
+        &nbsp;= direct from courtsnb-coursnb.ca (often weeks ahead of CanLII)
     </p>
     {toc_html}
     """
@@ -500,7 +649,7 @@ def build_email_html(summaries_by_court, since_date):
                        border-bottom:1px solid #ccc; padding-bottom:4px;">
                 {court_name} {lang_badge}
                 <span style="font-weight:normal; font-size:16px; color:#666;">
-                    — {count} décision{"s" if count != 1 else ""}
+                    — {count} decision{"s" if count!=1 else ""}
                 </span>
             </h2>"""
 
@@ -509,18 +658,17 @@ def build_email_html(summaries_by_court, since_date):
                 summary_html  = render_markdown_bold(case["summary"])
                 comments_html = render_markdown_bold(case.get("comments", ""))
 
-                # Emoji section headers in comments get a subtle highlight
                 for emoji in ["📌", "⚖️", "🔄", "🌐", "📏", "⚠️", "💡"]:
                     comments_html = comments_html.replace(
                         f"<strong>{emoji}",
                         f'<strong style="display:inline-block; margin-top:10px;">{emoji}'
                     )
 
+                sbadge = source_badge(case.get("source", "canlii"))
+
                 html += f"""
                 <div style="background:#f4f8fc; border-left:4px solid #1a3a5c;
                             padding:16px 20px; margin:20px 0; border-radius:4px;">
-
-                    <!-- Case title -->
                     <p style="margin:0 0 12px 0; font-size:15px;">
                         {flag}<a href="{case['url']}"
                            style="color:#1a3a5c; font-weight:bold; text-decoration:none;">
@@ -529,35 +677,30 @@ def build_email_html(summaries_by_court, since_date):
                         <span style="color:#888; font-size:13px; margin-left:8px;">
                             {case['citation']}
                         </span>
+                        {sbadge}
                     </p>
-
-                    <!-- Summary -->
-                    <div style="font-size:14px; line-height:1.8;">
-                        {summary_html}
-                    </div>
-
-                    <!-- Comments section divider -->
+                    <div style="font-size:14px; line-height:1.8;">{summary_html}</div>
                     <div style="margin-top:20px; padding-top:16px;
-                                border-top: 2px solid #1a3a5c;">
-                        <div style="font-size:13px; font-weight:bold; color:{('#1a7a3c' if is_fr else '#1a3a5c')};
-                                    letter-spacing:0.5px; margin-bottom:10px; text-transform:uppercase;">
+                                border-top:2px solid #1a3a5c;">
+                        <div style="font-size:13px; font-weight:bold;
+                                    color:{'#1a7a3c' if is_fr else '#1a3a5c'};
+                                    letter-spacing:0.5px; margin-bottom:10px;
+                                    text-transform:uppercase;">
                             {'💬 Commentaires' if is_fr else '💬 Comments'}
                         </div>
                         <div style="font-size:14px; line-height:1.9;
-                                    background:#fff; border-radius:4px;
-                                    padding:14px 16px;
-                                    border-left: 3px solid {'#1a7a3c' if is_fr else '#e8a020'};">
+                                    background:#fff; border-radius:4px; padding:14px 16px;
+                                    border-left:3px solid {'#1a7a3c' if is_fr else '#e8a020'};">
                             {comments_html if comments_html else
                              "<em style='color:#999;'>No commentary generated.</em>"}
                         </div>
                     </div>
-
                 </div>"""
 
     html += f"""
     <hr style="margin-top:44px; border:none; border-top:1px solid #ddd;">
     <p style="color:#aaa; font-size:12px; text-align:center;">
-        NB Legal Agent v6 — CanLII API + Claude AI — {today}
+        NB Legal Agent v7 — CanLII API + NB Courts + Claude AI — {today}
     </p>
     </body></html>"""
     return html
@@ -571,7 +714,7 @@ def send_email(html_body, total_cases, offence_tags):
     today   = datetime.now().strftime("%B %d, %Y")
     subject = (
         f"NB Criminal Digest — {today} "
-        f"({total_cases} decision{'s' if total_cases != 1 else ''})"
+        f"({total_cases} decision{'s' if total_cases!=1 else ''})"
         f"{offence_tags}"
     )
     msg = MIMEMultipart("alternative")
@@ -579,14 +722,44 @@ def send_email(html_body, total_cases, offence_tags):
     msg["From"]    = EMAIL_SENDER
     msg["To"]      = EMAIL_RECEIVER
     msg.attach(MIMEText(html_body, "html"))
-
     with smtplib.SMTP("smtp.gmail.com", 587) as server:
         server.ehlo()
         server.starttls()
         server.login(EMAIL_SENDER, EMAIL_PASSWORD)
         server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
-
     print(f"Email sent: {subject}")
+
+
+# ============================================================
+# PROCESS A SINGLE CASE (shared by both pipelines)
+# ============================================================
+
+def process_case(text, title, citation, case_url, lang, source, seen_cases, new_seen, unique_id):
+    """
+    Run Claude summary + analysis on a case and return the result dict,
+    or None if the case should be skipped.
+    """
+    print(f"      → Summarizing ...")
+    summary = summarize_case(text, title, citation, lang=lang)
+
+    if summary.startswith("NOT_CRIMINAL"):
+        print(f"      → Claude: not criminal. Skipping.")
+        new_seen.add(unique_id)
+        return None
+
+    print(f"      → Analyzing ...")
+    comments = analyze_case(text, title, citation, summary, lang=lang)
+
+    new_seen.add(unique_id)
+    return {
+        "title":    title,
+        "citation": citation,
+        "url":      case_url,
+        "summary":  summary,
+        "comments": comments,
+        "lang":     lang,
+        "source":   source,
+    }
 
 
 # ============================================================
@@ -595,17 +768,20 @@ def send_email(html_body, total_cases, offence_tags):
 
 def run():
     print(f"\n{'='*60}")
-    print(f"NB Legal Agent v6 — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"NB Legal Agent v7 — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"{'='*60}\n")
 
     seen_cases, last_run_date = load_state()
     since_date = get_lookback_date(last_run_date)
 
-    summaries_by_court     = {}
-    new_seen               = set()
-    processed_court_langs  = set()
+    summaries_by_court    = {}
+    new_seen              = set()
+    processed_court_langs = set()
 
-    for court in NB_COURTS:
+    # ── PIPELINE 1: CanLII ────────────────────────────────────────────────────
+    print("\n── Source 1: CanLII API ────────────────────────────────────\n")
+
+    for court in NB_COURTS_CANLII:
         court_id   = court["id"]
         court_name = court["name"]
         lang       = court["lang"]
@@ -616,9 +792,8 @@ def run():
         processed_court_langs.add(key)
 
         print(f"Fetching: {court_name} ...")
-
         try:
-            cases = fetch_recent_cases(court_id, lang, since_date)
+            cases = fetch_recent_cases_canlii(court_id, lang, since_date)
         except Exception as e:
             print(f"   WARNING: Could not fetch {court_name}: {e}")
             summaries_by_court[court_name] = []
@@ -634,7 +809,7 @@ def run():
             if isinstance(case_id, dict):
                 case_id = case_id.get("en") or case_id.get("fr") or str(case_id)
 
-            unique_id = f"{court_id}/{lang}/{case_id}"
+            unique_id = f"canlii/{court_id}/{lang}/{case_id}"
             title     = case.get("title", "Untitled")
             citation  = case.get("citation", "")
             case_url  = f"https://www.canlii.org/{lang}/{court_id}/{case_id}.html"
@@ -642,63 +817,119 @@ def run():
             if unique_id in seen_cases:
                 continue
 
-            # ── Filter: CanLII topics then keyword fallback ───────────────────
             topics, _ = fetch_case_metadata(court_id, case_id, lang)
             topic_result = is_criminal_by_topics(topics)
             time.sleep(0.3)
 
             if topic_result is False:
-                print(f"   Skipping (CanLII topics): {title}")
+                print(f"   Skipping (CanLII topics — not criminal): {title}")
                 new_seen.add(unique_id)
                 skipped += 1
                 continue
             elif topic_result is None:
                 if not is_criminal_by_keywords(title, citation, lang=lang):
-                    print(f"   Skipping (keywords): {title}")
+                    print(f"   Skipping (keywords — not criminal): {title}")
                     new_seen.add(unique_id)
                     skipped += 1
                     continue
 
-            # ── Fetch full text ───────────────────────────────────────────────
             print(f"   Processing: {title} ...")
             try:
-                text = fetch_case_text(court_id, case_id, lang)
+                text = fetch_case_text_canlii(court_id, case_id, lang)
                 time.sleep(0.3)
-
-                # ── Call 1: Structured summary ────────────────────────────────
-                print(f"      → Summarizing ...")
-                summary = summarize_case(text, title, citation, lang=lang)
-
-                if summary.startswith("NOT_CRIMINAL"):
-                    print(f"      → Claude: not criminal. Skipping.")
-                    new_seen.add(unique_id)
+                result = process_case(
+                    text, title, citation, case_url, lang, "canlii",
+                    seen_cases, new_seen, unique_id
+                )
+                if result:
+                    court_summaries.append(result)
+                else:
                     skipped += 1
-                    continue
-
-                # ── Call 2: Analytical commentary ─────────────────────────────
-                print(f"      → Analyzing ...")
-                comments = analyze_case(text, title, citation, summary, lang=lang)
-
-                court_summaries.append({
-                    "title":    title,
-                    "citation": citation,
-                    "url":      case_url,
-                    "summary":  summary,
-                    "comments": comments,
-                    "lang":     lang,
-                })
-                new_seen.add(unique_id)
-
             except Exception as e:
                 print(f"   WARNING: Could not process {title}: {e}")
 
         summaries_by_court[court_name] = court_summaries
         print(f"   {len(court_summaries)} included, {skipped} skipped\n")
 
+    # ── PIPELINE 2: NB Courts Website — Court of Appeal ──────────────────────
+    print("\n── Source 2: NB Courts Website (Court of Appeal) ───────────\n")
+
+    nbcourts_label = "NB Court of Appeal — NB Courts Website"
+    nbcourts_cases = []
+    skipped_nbcourts = 0
+
+    try:
+        decisions = fetch_nbcourts_decisions(since_date)
+
+        # Track citations already seen from CanLII to avoid duplicates
+        canlii_citations = set()
+        for cases in summaries_by_court.values():
+            for c in cases:
+                if c.get("citation"):
+                    canlii_citations.add(c["citation"].strip())
+
+        for dec in decisions:
+            title    = dec["title"]
+            citation = dec["citation"]
+            pdf_url  = dec["pdf_url"]
+            lang     = dec["lang"]
+            case_url = dec["url"]
+
+            # Skip if already captured from CanLII by citation
+            if citation and citation in canlii_citations:
+                print(f"   Skipping (already in CanLII): {title} {citation}")
+                skipped_nbcourts += 1
+                continue
+
+            # Unique ID based on PDF URL (stable identifier for NB Courts decisions)
+            unique_id = f"nbcourts/{re.sub(r'[^a-z0-9]', '_', pdf_url.lower())}"
+
+            if unique_id in seen_cases:
+                continue
+
+            # For NB Courts website decisions we skip the keyword filter entirely.
+            # The CA decisions page only lists Court of Appeal judgments — every one
+            # is worth Claude screening. The keyword filter was designed for CanLII
+            # where hundreds of mixed civil/criminal cases arrive together. Here it
+            # was incorrectly rejecting cases like "Legal Aid Commission v. R." because
+            # the title has "v. R." (Crown as respondent) not "R. v." (Crown prosecuting).
+            # Claude will flag non-criminal cases with NOT_CRIMINAL as usual.
+
+            print(f"   Processing: {title} {citation} ...")
+            try:
+                text = fetch_pdf_text(pdf_url)
+                time.sleep(0.5)
+
+                if not text or len(text) < 200:
+                    print(f"      WARNING: PDF too short or empty — skipping")
+                    skipped_nbcourts += 1
+                    continue
+
+                result = process_case(
+                    text, title, citation, case_url, lang, "nbcourts",
+                    seen_cases, new_seen, unique_id
+                )
+                if result:
+                    # Use the PDF URL as the clickable link so they can read the full decision
+                    result["url"] = pdf_url
+                    nbcourts_cases.append(result)
+                else:
+                    skipped_nbcourts += 1
+
+            except Exception as e:
+                print(f"   WARNING: Could not process {title}: {e}")
+
+    except Exception as e:
+        print(f"   WARNING: NB Courts pipeline failed: {e}")
+
+    summaries_by_court[nbcourts_label] = nbcourts_cases
+    print(f"   {len(nbcourts_cases)} included, {skipped_nbcourts} skipped\n")
+
+    # ── EMAIL ─────────────────────────────────────────────────────────────────
     total        = sum(len(v) for v in summaries_by_court.values())
     offence_tags = extract_offence_tags(summaries_by_court)
 
-    print(f"Building email — {total} case(s) ...")
+    print(f"Building email — {total} case(s) total ...")
     html_body = build_email_html(summaries_by_court, since_date)
     send_email(html_body, total, offence_tags)
 
@@ -708,8 +939,7 @@ def run():
 
 
 if __name__ == "__main__":
-    # Uncomment the lines below if running daily on PythonAnywhere
-    # and you only want emails on Fridays:
+    # Uncomment if running daily and want Friday-only delivery:
     # if datetime.now().weekday() != 4:
     #     print("Not Friday — skipping.")
     # else:
