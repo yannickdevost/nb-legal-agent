@@ -1,37 +1,29 @@
-# NB Legal Agent - GitHub Actions Workflow
-# Runs every Friday at 8:00 AM Atlantic Time (12:00 UTC in summer, 13:00 UTC in winter)
-# To change the time: edit the cron line below.
-#   UTC-4 (summer/ADT): use   0 12 * * 5
-#   UTC-3 (winter/AST): use   0 13 * * 5
-
 name: NB Legal Agent - Weekly Criminal Law Digest
 
 on:
   schedule:
     - cron: '0 12 * * 5'   # Every Friday at 12:00 UTC = 8:00 AM Atlantic Daylight Time
-  workflow_dispatch:         # Also allows manual trigger from the GitHub website
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   run-agent:
     runs-on: ubuntu-latest
 
     steps:
-      # Step 1: Download your repository files onto the GitHub server
       - name: Check out repository
         uses: actions/checkout@v4
 
-      # Step 2: Install Python
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      # Step 3: Install required Python libraries
       - name: Install dependencies
-        run: pip install requests anthropic
+        run: pip install requests anthropic pypdf
 
-      # Step 4: Restore the seen-cases state file from previous runs
-      # This ensures the agent remembers which cases it already processed
       - name: Restore agent state
         uses: actions/cache@v4
         with:
@@ -40,8 +32,6 @@ jobs:
           restore-keys: |
             agent-state-
 
-      # Step 5: Run the agent
-      # API keys are loaded from GitHub Secrets — never stored in the script
       - name: Run NB Legal Agent
         env:
           CANLII_API_KEY:    ${{ secrets.CANLII_API_KEY }}
@@ -51,7 +41,6 @@ jobs:
           EMAIL_RECEIVER:    ${{ secrets.EMAIL_RECEIVER }}
         run: python nb_legal_agent.py
 
-      # Step 6: Save the updated state file so next week's run knows what was already seen
       - name: Save agent state
         uses: actions/cache@v4
         with:
