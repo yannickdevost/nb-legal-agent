@@ -444,33 +444,16 @@ def analyze_case(case_text, case_title, citation, summary, lang="en"):
 avec une expertise approfondie en droit criminel canadien, en jurisprudence du Nouveau-Brunswick
 et des provinces atlantiques, ainsi qu'en droit constitutionnel (Charte canadienne des droits et libertés).
 
-Rédige une section de COMMENTAIRES analytiques EN FRANÇAIS, structurée ainsi :
+Rédige une section de COMMENTAIRES analytiques EN FRANÇAIS pour un(e) procureur(e) de la Couronne au N.-B.
 
-**📌 Pertinence**
-Cette décision est-elle pertinente pour la pratique quotidienne d'un procureur de la Couronne au N.-B. ?
-
-**⚖️ Impact sur le droit au Nouveau-Brunswick**
-Cette décision modifie-t-elle, clarifie-t-elle ou confirme-t-elle le droit applicable au N.-B. ?
-S'inscrit-elle dans une tendance jurisprudentielle ? Pourrait-elle servir de précédent ?
-
-**🔄 Conflits et tensions jurisprudentiels**
-Cette décision est-elle en opposition ou en tension avec d'autres décisions — que ce soit d'autres
-tribunaux du N.-B., d'autres provinces, ou de la Cour suprême du Canada ?
-
-**🌐 Comparaison avec les autres provinces et les tribunaux supérieurs**
-Le droit appliqué est-il le même dans les autres provinces ? La Cour suprême du Canada s'est-elle
-prononcée sur cette question ? Si oui, la décision est-elle conforme à l'arrêt de la Cour suprême ?
-
-**📏 Analyse de la peine (le cas échéant)**
-Si c'est une décision sur la peine : fourchette habituelle au N.-B., position de cette peine dans la
-fourchette, facteurs aggravants/atténuants notables. Sinon : N/A
-
-**⚠️ Erreurs judiciaires potentielles et raisonnement questionnable**
-Le juge a-t-il commis une erreur de droit ou de fait ? Le raisonnement est-il solide ?
-Cette décision serait-elle susceptible d'être infirmée en appel ? Sois direct et honnête.
-
-**💡 Points d'action pour la Couronne**
-Éléments à surveiller, arguments à préparer, distinctions à noter pour des dossiers similaires.
+RÈGLES IMPORTANTES :
+- Identifie UNIQUEMENT les 2 à 4 points les plus importants que cette décision soulève pour un procureur.
+- Ne commente QUE ce qui est réellement notable dans cette décision. Si un aspect est banal ou sans intérêt pratique, ne l'inclus pas.
+- N'invente pas de catégories fixes. Utilise un titre court et descriptif pour chaque point, adapté au contenu.
+- Sois direct et concis. Chaque point devrait tenir en 2 à 5 phrases.
+- Si la décision est purement routinière et sans intérêt particulier pour la pratique, dis-le franchement en une phrase.
+- N'utilise PAS de catégories prédéfinies (pas de "Pertinence", "Impact sur le droit", etc. systématiques).
+- Exemples de titres possibles selon le cas : "Nouveau précédent contraignant", "Point de vigilance en appel", "Fourchette de peine à retenir", "Impact sur les dossiers en cours", "Argument à anticiper de la défense" — ou tout autre titre pertinent.
 
 ---
 RÉSUMÉ :
@@ -485,34 +468,16 @@ TEXTE COMPLET :
 with deep expertise in Canadian criminal law, NB and Atlantic Canadian case law,
 and constitutional law under the Charter.
 
-Write an analytical COMMENTS section structured exactly as follows:
+Write an analytical COMMENTS section for a NB Crown Prosecutor.
 
-**📌 Relevance**
-Is this decision relevant to the day-to-day practice of a Crown Prosecutor in NB?
-Why or why not? Routine or broader significance?
-
-**⚖️ Impact on New Brunswick Law**
-Does this decision change, clarify, or confirm the law in NB?
-Does it fit a broader jurisprudential trend? Could it be used as precedent?
-
-**🔄 Conflicts and Tensions with Other Decisions**
-Is this in conflict or tension with other NB decisions, other provinces, or the SCC?
-Is there a provincial split on this legal question?
-
-**🌐 Comparison with Other Provinces and Higher Courts**
-Is the law applied here consistent across Canadian provinces?
-Has the Supreme Court of Canada addressed this issue? Is this decision consistent with the SCC?
-
-**📏 Sentencing Analysis (if applicable)**
-If sentencing: typical range in NB/Atlantic Canada, where this sentence falls, notable
-aggravating/mitigating factors. If not a sentencing decision: N/A
-
-**⚠️ Potential Judicial Errors and Questionable Reasoning**
-Did the judge make an error of law or fact? Is the reasoning sound?
-Would this be vulnerable on appeal? Be direct and honest.
-
-**💡 Action Points for the Crown**
-Things to watch for, arguments to prepare, distinctions to draw in similar cases.
+IMPORTANT RULES:
+- Identify ONLY the 2 to 4 most important points this decision raises for Crown practice.
+- Only comment on what is genuinely notable. If an aspect is routine or unremarkable, leave it out entirely.
+- Do NOT use fixed categories. Give each point a short, descriptive heading that fits the content.
+- Be direct and concise. Each point should be 2 to 5 sentences.
+- If the decision is entirely routine with nothing of particular significance, say so plainly in one sentence.
+- Do NOT use preset headings like "Relevance", "Impact on NB Law", etc. as a checklist.
+- Examples of possible headings depending on the case: "New binding precedent", "Sentencing range to note", "Watch point on appeal", "Impact on pending files", "Anticipate this defence argument" — or whatever heading actually fits.
 
 ---
 CASE SUMMARY:
@@ -525,7 +490,7 @@ FULL CASE TEXT:
 
     message = client.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=1800,
+        max_tokens=800,
         messages=[{"role": "user", "content": prompt}]
     )
     return message.content[0].text.strip()
@@ -658,11 +623,13 @@ def build_email_html(summaries_by_court, since_date):
                 summary_html  = render_markdown_bold(case["summary"])
                 comments_html = render_markdown_bold(case.get("comments", ""))
 
-                for emoji in ["📌", "⚖️", "🔄", "🌐", "📏", "⚠️", "💡"]:
-                    comments_html = comments_html.replace(
-                        f"<strong>{emoji}",
-                        f'<strong style="display:inline-block; margin-top:10px;">{emoji}'
-                    )
+                # Style any bold heading in comments with top margin (works for free-form headings)
+                import re as _re
+                comments_html = _re.sub(
+                    r'<strong>',
+                    '<strong style="display:inline-block; margin-top:12px;">',
+                    comments_html
+                )
 
                 sbadge = source_badge(case.get("source", "canlii"))
 
