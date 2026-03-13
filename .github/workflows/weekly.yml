@@ -24,14 +24,6 @@ jobs:
       - name: Install dependencies
         run: pip install requests anthropic pypdf
 
-      - name: Restore agent state
-        uses: actions/cache@v4
-        with:
-          path: agent_state.json
-          key: agent-state-${{ github.run_id }}
-          restore-keys: |
-            agent-state-
-
       - name: Run NB Legal Agent
         env:
           CANLII_API_KEY:    ${{ secrets.CANLII_API_KEY }}
@@ -41,8 +33,10 @@ jobs:
           EMAIL_RECEIVER:    ${{ secrets.EMAIL_RECEIVER }}
         run: python nb_legal_agent.py
 
-      - name: Save agent state
-        uses: actions/cache@v4
-        with:
-          path: agent_state.json
-          key: agent-state-${{ github.run_id }}
+      - name: Save agent state back to repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add agent_state.json
+          git diff --staged --quiet || git commit -m "Update agent state [skip ci]"
+          git push
