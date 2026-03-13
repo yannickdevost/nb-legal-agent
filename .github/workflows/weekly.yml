@@ -5,12 +5,15 @@ on:
     - cron: '0 12 * * 5'   # Every Friday at 12:00 UTC = 8:00 AM Atlantic Daylight Time
   workflow_dispatch:
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
   run-agent:
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    # Give the workflow write permission to commit back to the repository
+    permissions:
+      contents: write
 
     steps:
       - name: Check out repository
